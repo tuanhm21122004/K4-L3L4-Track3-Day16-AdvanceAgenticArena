@@ -104,12 +104,14 @@ you switch the addendum on, measure your own efficiency delta with
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 
 from arena.model import (
     ARENA_SYSTEM_PROMPT,
     TOOL_ERROR_PREFIX,
+    ParsedOutput,
     parse_output,
 )
 from arena.tools import ToolResult
@@ -375,6 +377,39 @@ def _without_quoted_finals(text: str) -> str:
     return "\n".join(kept) if dropped else text
 
 
+_SMART_QUOTES = str.maketrans({
+    "“": '"', "”": '"', "„": '"', "‟": '"',
+    "‘": "'", "’": "'", "«": '"', "»": '"',
+})
+_THOUGHT_LOOSE_RE = re.compile(r"(?:^|\n)[ \t]*thought[ \t]*:[ \t]*(.*)", re.IGNORECASE)
+
+
+def _recover_action(text: str) -> ParsedOutput | None:
+    """Recover an ACTION payload from malformed, fenced or multiline model text."""
+    if not isinstance(text, str) or ("{" not in text and "[" not in text):
+        return None
+    cleaned = text.translate(_SMART_QUOTES)
+    decoder = json.JSONDecoder()
+    idx = cleaned.find("{")
+    while idx != -1:
+        try:
+            payload, _ = decoder.raw_decode(cleaned[idx:])
+            if isinstance(payload, dict) and "tool" in payload and isinstance(payload["tool"], str):
+                args = payload.get("args")
+                t_match = _THOUGHT_LOOSE_RE.search(text)
+                thought = t_match.group(1).strip() if t_match else ""
+                return ParsedOutput(
+                    kind="action",
+                    thought=thought,
+                    tool=payload["tool"],
+                    args=args if isinstance(args, dict) else {},
+                )
+        except Exception:
+            pass
+        idx = cleaned.find("{", idx + 1)
+    return None
+
+
 def _action_under_final(text: str):
     """A well-formed ACTION written BELOW this turn's FINAL line, or None.
 
@@ -387,8 +422,13 @@ def _action_under_final(text: str):
     lines = text.split("\n")
     for index, line in enumerate(lines):
         if line.startswith(_FINAL_MARKER):
-            below = parse_output("\n".join(lines[index + 1:]))
-            return below if below.kind == "action" else None
+            subtext = "\n".join(lines[index + 1:])
+            below = parse_output(subtext)
+            if below.kind == "action":
+                return below
+            recovered = _recover_action(subtext)
+            if recovered is not None:
+                return recovered
     return None
 
 
@@ -593,6 +633,11 @@ class ReActAgent:
         """
         parsed = parse_output(_canonicalise(text))
         if parsed.kind != "final":
+            if parsed.kind == "action":
+                return parsed
+            recovered = _recover_action(text)
+            if recovered is not None:
+                return recovered
             return parsed
 
         if _is_report_payload(parsed.final):
@@ -610,7 +655,12 @@ class ReActAgent:
         # Strict, NOT canonicalised: normalisation is what resurrects a
         # non-canonical marker such as `final: {}` in the first place, and
         # this path exists precisely to look underneath one.
-        return parse_output(_without_quoted_finals(text))
+        fallback = parse_output(_without_quoted_finals(text))
+        if fallback.kind != "final" and fallback.kind != "action":
+            recovered = _recover_action(_without_quoted_finals(text))
+            if recovered is not None:
+                return recovered
+        return fallback
 
     # -- the model -----------------------------------------------------
 
@@ -664,12 +714,50 @@ class ReActAgent:
     def _dispatch(self, name: str, args: dict) -> ToolResult:
         """The innermost tool call — what `wrap_tool_call` wraps."""
         args = args if isinstance(args, dict) else {}
-        if name == "search":
-            return self.tools.search(_as_text(args.get("query")), k=_as_k(args.get("k")))
-        if name == "fetch_doc":
-            return self.tools.fetch_doc(_as_text(args.get("doc_id")))
-        if name == "calc":
-            return self.tools.calc(_as_text(args.get("expression")) or "0")
+        if isinstance(args, str):
+            try:
+                decoded = json.loads(args)
+                if isinstance(decoded, dict):
+                    args = decoded
+            except Exception:
+                pass
+        name = (name or "").strip().lower()
+
+        # Handle tool name and parameter aliases for real model robustness
+        if name in ("search", "find", "lookup"):
+            q = (
+                args.get("query")
+                or args.get("q")
+                or args.get("search_query")
+                or args.get("keyword")
+                or args.get("text")
+            )
+            k = args.get("k") or args.get("top_k") or args.get("limit") or 5
+            return self.tools.search(_as_text(q), k=_as_k(k))
+
+        if name in ("fetch_doc", "fetch", "get_doc", "read_doc", "fetch_document", "doc"):
+            did = (
+                args.get("doc_id")
+                or args.get("id")
+                or args.get("doc")
+                or args.get("document_id")
+            )
+            did_text = _as_text(did).strip()
+            # Normalize doc-X / doc_XXXX / docX to doc-XXXX
+            match = re.match(r"^doc[-_]?(\d{1,4})$", did_text, re.IGNORECASE)
+            if match:
+                did_text = f"doc-{int(match.group(1)):04d}"
+            return self.tools.fetch_doc(did_text)
+
+        if name in ("calc", "calculate", "calculator", "eval"):
+            expr = (
+                args.get("expression")
+                or args.get("expr")
+                or args.get("calculation")
+                or args.get("math")
+            )
+            return self.tools.calc(_as_text(expr) or "0")
+
         return ToolResult(ok=False, content="", error=f"unknown tool: {name!r}")
 
 

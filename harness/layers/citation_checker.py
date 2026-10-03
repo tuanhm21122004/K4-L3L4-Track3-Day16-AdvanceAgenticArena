@@ -59,7 +59,30 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
+import unicodedata
+
 from harness.middleware import Middleware
+
+_WS_RE = re.compile(r"\s+")
+
+
+def _norm(text: str) -> str:
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    return _WS_RE.sub(" ", unicodedata.normalize("NFC", text).casefold()).strip()
+
+
+def _norm_lines(text: str) -> tuple[str, ...]:
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    return tuple(line for line in (_norm(raw) for raw in text.splitlines()) if line)
+
+
+def _supports(normalised_lines: tuple[str, ...] | list[str], normalised_claim: str) -> bool:
+    if len(normalised_claim) < 12:
+        return False
+    return any(normalised_claim in line for line in normalised_lines)
 
 
 class CitationChecker(Middleware):
@@ -68,16 +91,71 @@ class CitationChecker(Middleware):
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+
+        # Precompute normalized lines for all docs in corpus
+        doc_norm_lines = {doc.doc_id: _norm_lines(doc.body) for doc in ctx.corpus.docs}
+
+        # Candidate documents observed during the run
+        # Priority 1: full body was fetched cleanly
+        fully_fetched = [doc for doc in ctx.corpus.docs if doc.body in ctx.observed_text]
+        # Priority 2: doc was seen in search results
+        search_seen = [
+            doc for doc in ctx.corpus.docs
+            if doc.doc_id in ctx.observed_text and doc not in fully_fetched
+        ]
+
+        def _is_doc_support(doc, raw_t: str, norm_t: str) -> bool:
+            if not doc or not doc.body:
+                return False
+            # Check exact raw match first
+            if any(raw_t in line for line in doc.body.splitlines()):
+                return True
+            # Check normalized match (same as arena.scorer._supports)
+            return _supports(doc_norm_lines.get(doc.doc_id, ()), norm_t)
+
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text", "")
+            if not isinstance(text, str) or not text.strip():
+                continue
+
+            norm_text = _norm(text)
+            if len(norm_text) < 12:
+                continue
+
+            doc_id = claim.get("doc_id")
+            if isinstance(doc_id, str):
+                claim["doc_id"] = doc_id.strip()
+                doc_id = claim["doc_id"]
+            current_doc = ctx.corpus.get(doc_id) if doc_id else None
+
+            # If current doc is already observed and supports the claim, keep it!
+            if current_doc and (current_doc in fully_fetched or current_doc in search_seen):
+                if _is_doc_support(current_doc, text, norm_text):
+                    continue
+
+            # Otherwise, find the true observed document supporting the claim
+            matched_doc = None
+            for candidate in fully_fetched:
+                if _is_doc_support(candidate, text, norm_text):
+                    matched_doc = candidate
+                    break
+
+            if matched_doc is None:
+                for candidate in search_seen:
+                    if _is_doc_support(candidate, text, norm_text):
+                        matched_doc = candidate
+                        break
+
+            if matched_doc is not None:
+                claim["doc_id"] = matched_doc.doc_id
+
+        report["citations"] = sorted({
+            c["doc_id"] for c in claims
+            if isinstance(c, dict) and isinstance(c.get("doc_id"), str) and c["doc_id"]
+        })
+        return report
